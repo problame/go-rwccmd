@@ -28,8 +28,8 @@ const (
 //
 // If it stops executing due to a signal from outside this application, I/O operations return an ErrKilledFromOutside.
 //
-// If it exists by its own, I/O operations return io.EOF if it exists with status 0 (success),
-// and io.ErrUnexpectedEOF in all other exists (non-signal) cases.
+// If it exits on its own, I/O operations return io.EOF if it exited with status 0 (success),
+// and *exec.ExitError in all other exists (non-signal) cases.
 type Cmd struct {
 	state int32 // state
 	// only valid if state == st_close_end
@@ -46,6 +46,7 @@ type Cmd struct {
 	cancel context.CancelFunc
 	stdout io.ReadCloser
 	stdin io.WriteCloser
+	stderr *stderrWriter
 
 	log Logger
 }
@@ -73,7 +74,10 @@ func CommandContext(ctx context.Context, bin string, args []string, env []string
 		return nil, err
 	}
 
-	c := &Cmd{cmd: cmd, cancel: cancel, stdout: stdout, stdin:stdin, log: log}
+	stderrWriter := &stderrWriter{}
+	cmd.Stderr = stderrWriter
+
+	c := &Cmd{cmd: cmd, cancel: cancel, stdout: stdout, stdin:stdin, stderr: stderrWriter, log: log}
 	atomic.StoreInt32(&c.state, st_init)
 
 	return c, nil
@@ -129,7 +133,6 @@ func (c *Cmd) Read(out []byte) (n int, err error) {
 var errorWhileRW = errors.New("errorWhileRW")
 
 var ErrDeadline = errors.New("deadline expired")
-var ErrKilledFromOutside = errors.New("process killed from outside the application")
 
 func (c *Cmd) Write(out []byte) (n int, err error) {
 	if atomic.LoadInt32(&c.state) != st_init {
@@ -220,6 +223,7 @@ func (c *Cmd) close(ioErr error) (err error) {
 		c.ioErr = waitErr
 		return waitErr
 	}
+	exitErr.Stderr = c.stderr.Bytes()
 
 	c.log.Printf("wait returned ExitError: %s", exitErr)
 	ws := exitErr.Sys().(syscall.WaitStatus)
@@ -246,13 +250,11 @@ func (c *Cmd) close(ioErr error) (err error) {
 	c.log.Printf("we didn't kill the process")
 
 	if ws.Exited() {
-		c.log.Printf("we have not cancelled the process, it exited with non-zero exit status %d", ws.ExitStatus())
-		c.waitErr = io.ErrUnexpectedEOF
-		c.ioErr = io.ErrUnexpectedEOF
-		return c.ioErr
+		c.log.Printf("process exited on its own with non-zero exit status %d", ws.ExitStatus())
+	} else {
+		c.log.Printf("process exited due to an external event")
 	}
-
-	c.waitErr = ErrKilledFromOutside
-	c.ioErr = ErrKilledFromOutside
+	c.waitErr = exitErr
+	c.ioErr = exitErr
 	return c.waitErr
 }
